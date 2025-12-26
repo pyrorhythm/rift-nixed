@@ -43,7 +43,7 @@
         version = "0.2.8";
         src = builtins.fetchTarball {
           url = "https://github.com/acsandmann/rift/releases/download/v0.2.8/rift-universal-macos-0.2.8.tar.gz";
-          sha256 = "1cm3nqz6bl01i337yg1l9v616w4kkcsc1m725s9hgj5zgprhybna";
+          sha256 = "1amimyvf35dw5czxxp53adfl9nzhk8xkabaljy5x17c2qd935krk";
         };
         phases = [ "installPhase" ];
         installPhase = ''
