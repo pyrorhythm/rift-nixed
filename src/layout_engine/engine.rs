@@ -10,10 +10,12 @@ use tracing::{debug, info, warn};
 use super::{Direction, FloatingManager, LayoutId, LayoutSystemKind, WorkspaceLayouts};
 use crate::actor::app::{AppInfo, WindowId, pid_t};
 use crate::actor::broadcast::{BroadcastEvent, BroadcastSender};
-use crate::common::collections::HashMap;
+use crate::common::collections::{HashMap, HashSet};
 use crate::common::config::LayoutSettings;
 use crate::layout_engine::LayoutSystem;
-use crate::model::{VirtualWorkspaceId, VirtualWorkspaceManager};
+use crate::model::virtual_workspace::{
+    AppRuleAssignment, AppRuleResult, VirtualWorkspaceId, VirtualWorkspaceManager,
+};
 use crate::sys::screen::SpaceId;
 
 #[derive(Debug, Clone)]
@@ -107,6 +109,8 @@ pub struct LayoutEngine {
     broadcast_tx: Option<BroadcastSender>,
     #[serde(skip)]
     space_display_map: HashMap<SpaceId, Option<String>>,
+    #[serde(skip)]
+    display_last_space: HashMap<String, SpaceId>,
 }
 
 impl LayoutEngine {
@@ -479,10 +483,19 @@ impl LayoutEngine {
 
     pub fn update_space_display(&mut self, space: SpaceId, display_uuid: Option<String>) {
         if let Some(uuid) = display_uuid {
-            self.space_display_map.insert(space, Some(uuid));
+            self.space_display_map.insert(space, Some(uuid.clone()));
+            self.display_last_space.insert(uuid, space);
         } else {
             self.space_display_map.remove(&space);
         }
+    }
+
+    pub fn last_space_for_display_uuid(&self, display_uuid: &str) -> Option<SpaceId> {
+        self.display_last_space.get(display_uuid).copied()
+    }
+
+    pub fn display_seen_before(&self, display_uuid: &str) -> bool {
+        self.display_last_space.contains_key(display_uuid)
     }
 
     fn display_uuid_for_space(&self, space: SpaceId) -> Option<String> {
@@ -512,6 +525,22 @@ impl LayoutEngine {
         if let Some(uuid) = self.space_display_map.remove(&old_space) {
             self.space_display_map.insert(new_space, uuid);
         }
+
+        for (_uuid, space) in self.display_last_space.iter_mut() {
+            if *space == old_space {
+                *space = new_space;
+            }
+        }
+    }
+
+    pub fn prune_display_state(&mut self, active_display_uuids: &[String]) {
+        let active: HashSet<&str> = active_display_uuids.iter().map(|s| s.as_str()).collect();
+
+        self.display_last_space.retain(|uuid, _| active.contains(uuid.as_str()));
+
+        self.space_display_map.retain(|_, uuid_opt| {
+            uuid_opt.as_ref().map(|uuid| active.contains(uuid.as_str())).unwrap_or(false)
+        });
     }
 
     pub fn new(
@@ -540,6 +569,7 @@ impl LayoutEngine {
             layout_settings: layout_settings.clone(),
             broadcast_tx,
             space_display_map: HashMap::default(),
+            display_last_space: HashMap::default(),
         }
     }
 
@@ -596,7 +626,7 @@ impl LayoutEngine {
                     let ax_subrole_ref = ax_subrole_opt.as_deref();
 
                     let was_floating = self.floating.is_floating(wid);
-                    let (assigned_workspace, rule_says_float, prev_rule_decision) = match self
+                    let assignment = match self
                         .virtual_workspace_manager
                         .assign_window_with_app_info(
                             wid,
@@ -607,12 +637,15 @@ impl LayoutEngine {
                             ax_role_ref,
                             ax_subrole_ref,
                         ) {
-                        Ok((workspace_id, should_float, prev_rule_decision)) => {
-                            (workspace_id, should_float, prev_rule_decision)
-                        }
+                        Ok(AppRuleResult::Managed(decision)) => Some(decision),
+                        Ok(AppRuleResult::Unmanaged) => None,
                         Err(_) => {
                             match self.virtual_workspace_manager.auto_assign_window(wid, space) {
-                                Ok(ws) => (ws, was_floating, false),
+                                Ok(ws) => Some(AppRuleAssignment {
+                                    workspace_id: ws,
+                                    floating: was_floating,
+                                    prev_rule_decision: false,
+                                }),
                                 Err(_) => {
                                     warn!(
                                         "Could not determine workspace for window {:?} on space {:?}; skipping assignment",
@@ -622,6 +655,15 @@ impl LayoutEngine {
                                 }
                             }
                         }
+                    };
+
+                    let AppRuleAssignment {
+                        workspace_id: assigned_workspace,
+                        floating: rule_says_float,
+                        prev_rule_decision,
+                    } = match assignment {
+                        Some(assign) => assign,
+                        None => continue,
                     };
 
                     let should_float = rule_says_float || (!prev_rule_decision && was_floating);
@@ -904,14 +946,14 @@ impl LayoutEngine {
                 space,
                 visible_spaces,
                 visible_space_centers,
-                Direction::Left,
+                Direction::Right,
                 is_floating,
             ),
             LayoutCommand::PrevWindow => self.move_focus_internal(
                 space,
                 visible_spaces,
                 visible_space_centers,
-                Direction::Right,
+                Direction::Left,
                 is_floating,
             ),
             LayoutCommand::MoveFocus(direction) => {

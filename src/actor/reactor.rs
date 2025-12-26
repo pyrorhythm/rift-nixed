@@ -51,6 +51,7 @@ use crate::common::log::MetricsCommand;
 use crate::layout_engine::{self as layout, Direction, LayoutCommand, LayoutEngine, LayoutEvent};
 use crate::model::VirtualWorkspaceId;
 use crate::model::tx_store::WindowTxStore;
+use crate::model::virtual_workspace::AppRuleResult;
 use crate::sys::event::MouseState;
 use crate::sys::executor::Executor;
 use crate::sys::geometry::{CGRectDef, CGRectExt};
@@ -414,6 +415,7 @@ struct WindowState {
     is_ax_root: bool,
     is_minimized: bool,
     is_manageable: bool,
+    ignore_app_rule: bool,
     window_server_id: Option<WindowServerId>,
     #[allow(unused)]
     bundle_id: Option<String>,
@@ -432,6 +434,7 @@ impl From<WindowInfo> for WindowState {
             is_ax_root: info.is_root,
             is_minimized: info.is_minimized,
             is_manageable: false,
+            ignore_app_rule: false,
             window_server_id: info.sys_id,
             bundle_id: info.bundle_id,
             bundle_path: info.path,
@@ -439,6 +442,10 @@ impl From<WindowInfo> for WindowState {
             ax_subrole: info.ax_subrole,
         }
     }
+}
+
+impl WindowState {
+    fn is_effectively_manageable(&self) -> bool { self.is_manageable && !self.ignore_app_rule }
 }
 
 impl Reactor {
@@ -547,6 +554,7 @@ impl Reactor {
             },
             pending_space_change_manager: managers::PendingSpaceChangeManager {
                 pending_space_change: None,
+                topology_relayout_pending: false,
             },
             active_spaces: HashSet::default(),
         }
@@ -1042,7 +1050,11 @@ impl Reactor {
         self.update_screen_space_map();
     }
 
-    fn reconcile_spaces_with_display_history(&mut self, spaces: &[Option<SpaceId>]) {
+    fn reconcile_spaces_with_display_history(
+        &mut self,
+        spaces: &[Option<SpaceId>],
+        allow_remap: bool,
+    ) {
         let mut seen_displays: HashSet<String> = HashSet::default();
 
         for (screen, space_opt) in self.space_manager.screens.iter().zip(spaces.iter()) {
@@ -1056,13 +1068,30 @@ impl Reactor {
                 continue;
             }
 
-            if let Some(previous_space) =
-                self.layout_manager.layout_engine.space_for_display_uuid(&screen.display_uuid)
-            {
-                if previous_space != *space {
-                    self.layout_manager.layout_engine.remap_space(previous_space, *space);
+            let seen_before =
+                self.layout_manager.layout_engine.display_seen_before(&screen.display_uuid);
+            let last_space = if allow_remap && seen_before {
+                self.layout_manager
+                    .layout_engine
+                    .last_space_for_display_uuid(&screen.display_uuid)
+            } else {
+                None
+            };
+
+            // When a display reconnects, remap the most recent space observed for
+            // that display to the newly reported space so layout state follows the
+            // monitor. During routine space switches (allow_remap=false), we simply
+            // record the mapping without remapping.
+            if allow_remap {
+                if let Some(previous_space) = last_space {
+                    if previous_space != *space {
+                        self.layout_manager.layout_engine.remap_space(previous_space, *space);
+                    }
                 }
             }
+            self.layout_manager
+                .layout_engine
+                .update_space_display(*space, Some(screen.display_uuid.clone()));
         }
     }
 
@@ -1451,7 +1480,7 @@ impl Reactor {
         self.window_manager
             .windows
             .get(&id)
-            .map_or(false, |window| window.is_manageable)
+            .map_or(false, |window| window.is_effectively_manageable())
     }
 
     fn send_layout_event(&mut self, event: LayoutEvent) {
@@ -1471,7 +1500,9 @@ impl Reactor {
             return false;
         };
 
-        if !window.is_manageable && !self.layout_manager.layout_engine.is_window_floating(wid) {
+        if !window.is_effectively_manageable()
+            && !self.layout_manager.layout_engine.is_window_floating(wid)
+        {
             return false;
         }
 
@@ -1574,24 +1605,61 @@ impl Reactor {
         }
 
         for (space, wids) in windows_by_space {
+            let mut manageable_windows: Vec<WindowId> = Vec::new();
+
             for wid in &wids {
-                let title_opt = self.window_manager.windows.get(wid).map(|w| w.title.clone());
-                if let Err(e) = self
-                    .layout_manager
-                    .layout_engine
-                    .virtual_workspace_manager_mut()
-                    .assign_window_with_app_info(
-                        *wid,
-                        space,
-                        (&app_info.bundle_id).as_deref(),
-                        (&app_info.localized_name).as_deref(),
-                        title_opt.as_deref(),
-                        self.window_manager.windows.get(wid).and_then(|w| w.ax_role.as_deref()),
-                        self.window_manager.windows.get(wid).and_then(|w| w.ax_subrole.as_deref()),
-                    )
-                {
-                    warn!("Failed to assign window {:?} to workspace: {:?}", wid, e);
+                let assign_result = {
+                    let window = self.window_manager.windows.get(wid);
+                    self.layout_manager
+                        .layout_engine
+                        .virtual_workspace_manager_mut()
+                        .assign_window_with_app_info(
+                            *wid,
+                            space,
+                            app_info.bundle_id.as_deref(),
+                            app_info.localized_name.as_deref(),
+                            window.map(|w| w.title.as_str()),
+                            window.and_then(|w| w.ax_role.as_deref()),
+                            window.and_then(|w| w.ax_subrole.as_deref()),
+                        )
+                };
+
+                match assign_result {
+                    Ok(AppRuleResult::Managed(_)) => {
+                        if let Some(window) = self.window_manager.windows.get_mut(wid) {
+                            window.ignore_app_rule = false;
+                        }
+                        manageable_windows.push(*wid);
+                    }
+                    Ok(AppRuleResult::Unmanaged) => {
+                        if let Some(window) = self.window_manager.windows.get_mut(wid) {
+                            window.ignore_app_rule = true;
+                        }
+
+                        let needs_removal = {
+                            let engine = &self.layout_manager.layout_engine;
+                            engine
+                                .virtual_workspace_manager()
+                                .workspace_for_window(space, *wid)
+                                .is_some()
+                                || engine.is_window_floating(*wid)
+                        };
+                        if needs_removal {
+                            self.send_layout_event(LayoutEvent::WindowRemoved(*wid));
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to assign window {:?} to workspace: {:?}", wid, e);
+                        if let Some(window) = self.window_manager.windows.get_mut(wid) {
+                            window.ignore_app_rule = false;
+                        }
+                        manageable_windows.push(*wid);
+                    }
                 }
+            }
+
+            if manageable_windows.is_empty() {
+                continue;
             }
 
             let windows_with_titles: Vec<(
@@ -1599,7 +1667,7 @@ impl Reactor {
                 Option<String>,
                 Option<String>,
                 Option<String>,
-            )> = wids
+            )> = manageable_windows
                 .iter()
                 .map(|&wid| {
                     let title_opt = self.window_manager.windows.get(&wid).map(|w| w.title.clone());
@@ -2151,7 +2219,7 @@ impl Reactor {
             return None;
         }
         let window = self.window_manager.windows.get(&wid)?;
-        if window.is_manageable {
+        if window.is_effectively_manageable() {
             return None;
         }
         Some(wsid)
@@ -2432,32 +2500,63 @@ impl Reactor {
         origin: CGPoint,
         direction: Direction,
     ) -> Option<&Screen> {
+        fn interval_gap(a_min: f64, a_max: f64, b_min: f64, b_max: f64) -> f64 {
+            if a_max < b_min {
+                b_min - a_max
+            } else if b_max < a_min {
+                a_min - b_max
+            } else {
+                0.0
+            }
+        }
+
         let mut best: Option<(f64, f64, &Screen)> = None;
 
         for screen in &self.space_manager.screens {
-            let center = screen.frame.mid();
-            let delta = match direction {
-                Direction::Left => origin.x - center.x,
-                Direction::Right => center.x - origin.x,
-                // Screen coordinates are flipped vertically; a smaller y means visually "up".
-                Direction::Up => origin.y - center.y,
-                Direction::Down => center.y - origin.y,
-            };
-            if delta <= 0.0 {
+            let frame = screen.frame;
+
+            if frame.contains(origin) {
                 continue;
             }
 
-            let orthogonal = match direction {
-                Direction::Left | Direction::Right => (center.y - origin.y).abs(),
-                Direction::Up | Direction::Down => (center.x - origin.x).abs(),
+            let min = frame.min();
+            let max = frame.max();
+
+            let (primary_dist, orth_gap) = match direction {
+                Direction::Left => {
+                    if max.x > origin.x {
+                        continue;
+                    }
+                    (origin.x - max.x, interval_gap(min.y, max.y, origin.y, origin.y))
+                }
+                Direction::Right => {
+                    if min.x < origin.x {
+                        continue;
+                    }
+                    (min.x - origin.x, interval_gap(min.y, max.y, origin.y, origin.y))
+                }
+                Direction::Up => {
+                    // Smaller y means visually "up".
+                    if max.y > origin.y {
+                        continue;
+                    }
+                    (origin.y - max.y, interval_gap(min.x, max.x, origin.x, origin.x))
+                }
+                Direction::Down => {
+                    if min.y < origin.y {
+                        continue;
+                    }
+                    (min.y - origin.y, interval_gap(min.x, max.x, origin.x, origin.x))
+                }
             };
 
-            let should_replace = best.as_ref().map_or(true, |(best_delta, best_ortho, _)| {
-                delta < *best_delta || (delta == *best_delta && orthogonal < *best_ortho)
+            let should_replace = best.as_ref().map_or(true, |(best_primary, best_orth, _)| {
+                primary_dist < *best_primary
+                    || (primary_dist == *best_primary && orth_gap < *best_orth)
             });
 
             if should_replace {
-                best = Some((delta, orthogonal, screen));
+                best = Some((primary_dist, orth_gap, screen));
             }
         }
 
